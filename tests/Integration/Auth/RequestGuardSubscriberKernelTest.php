@@ -11,6 +11,7 @@ use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
 use Symfony\Component\HttpKernel\Controller\ArgumentResolver;
 use Symfony\Component\HttpKernel\Controller\ControllerResolver;
+use Symfony\Component\HttpKernel\Event\ExceptionEvent;
 use Symfony\Component\HttpKernel\Event\RequestEvent;
 use Symfony\Component\HttpKernel\HttpKernel;
 use Symfony\Component\HttpKernel\HttpKernelInterface;
@@ -58,6 +59,7 @@ final class RequestGuardSubscriberKernelTest extends TestCase
         bool $production = false,
         array $cidrs = [],
         array $enabledFeatures = [],
+        ?\Closure $controller = null,
     ): HttpKernel {
         $dispatcher = new EventDispatcher();
 
@@ -97,15 +99,23 @@ final class RequestGuardSubscriberKernelTest extends TestCase
 
         $dispatcher->addSubscriber($subscriber);
 
-        // A catch-all controller that returns 200 for any request that gets past the subscriber.
+        // A catch-all "controller" for any request that gets past the subscriber.
+        // Returns 200 unless a custom closure is given.
+        $controller ??= static fn(): Response => new Response('OK', 200);
         $dispatcher->addListener(
             KernelEvents::REQUEST,
-            function (RequestEvent $event): void {
+            function (RequestEvent $event) use ($controller): void {
                 if (!$event->hasResponse()) {
-                    $event->setResponse(new Response('OK', 200));
+                    $event->setResponse($controller());
                 }
             },
             priority: -100,
+        );
+
+        // Stand-in for the framework's ErrorListener: uncaught exceptions become a 500.
+        $dispatcher->addListener(
+            KernelEvents::EXCEPTION,
+            static fn(ExceptionEvent $event) => $event->setResponse(new Response('error', 500)),
         );
 
         return new HttpKernel(
@@ -260,5 +270,166 @@ final class RequestGuardSubscriberKernelTest extends TestCase
         self::assertSame('GET', $record->method);
         self::assertSame(401, $record->statusCode);
         self::assertNotNull($record->failureReason);
+    }
+
+    #[Test]
+    public function passed_request_is_audited_with_the_status_the_controller_returned(): void
+    {
+        $kernel  = $this->buildKernel(controller: static fn(): Response => new Response('degraded', 503));
+        $request = Request::create('http://example.com/canary/health/ready');
+        $request->headers->set('Authorization', 'Bearer ' . self::MONITORING_TOKEN);
+
+        $response = $this->handle($kernel, $request);
+
+        self::assertSame(503, $response->getStatusCode());
+        self::assertCount(1, $this->auditRecords);
+        self::assertSame(503, $this->auditRecords[0]->statusCode);
+        self::assertSame(TokenScope::MONITORING, $this->auditRecords[0]->scope);
+        self::assertNull($this->auditRecords[0]->failureReason);
+    }
+
+    #[Test]
+    public function passed_request_is_audited_with_500_when_the_controller_throws(): void
+    {
+        $kernel  = $this->buildKernel(controller: static fn(): Response => throw new \RuntimeException('boom'));
+        $request = Request::create('http://example.com/canary/health/ready');
+        $request->headers->set('Authorization', 'Bearer ' . self::MONITORING_TOKEN);
+
+        // catch: true — the exception listener turns the exception into a response
+        // and the kernel still dispatches kernel.response, as in production.
+        $response = $kernel->handle($request, HttpKernelInterface::MAIN_REQUEST, true);
+
+        self::assertSame(500, $response->getStatusCode());
+        self::assertCount(1, $this->auditRecords);
+        self::assertSame(500, $this->auditRecords[0]->statusCode);
+    }
+
+    #[Test]
+    public function rejected_request_is_audited_once_with_the_guard_status(): void
+    {
+        $kernel  = $this->buildKernel();
+        $request = Request::create('http://example.com/canary/health/live');
+        $request->headers->set('Authorization', 'Bearer wrong');
+
+        $response = $this->handle($kernel, $request);
+
+        self::assertSame(401, $response->getStatusCode());
+        self::assertCount(1, $this->auditRecords);
+        self::assertSame(401, $this->auditRecords[0]->statusCode);
+    }
+
+    // ------------------------------------------------------------------
+    // Unknown paths under the prefix
+    // ------------------------------------------------------------------
+
+    #[Test]
+    public function unknown_path_and_disabled_group_look_the_same_to_a_caller_without_a_token(): void
+    {
+        // Health is disabled; /canary/nope matches no group at all.
+        $kernel = $this->buildKernel(enabledFeatures: ['cache']);
+
+        $disabled = $this->handle($kernel, Request::create('http://example.com/canary/health/live'));
+        $unknown  = $this->handle($kernel, Request::create('http://example.com/canary/nope'));
+
+        self::assertSame(404, $disabled->getStatusCode());
+        self::assertSame($disabled->getStatusCode(), $unknown->getStatusCode());
+        self::assertSame($this->normalisedBody($disabled), $this->normalisedBody($unknown));
+        self::assertSame($this->normalisedHeaders($disabled), $this->normalisedHeaders($unknown));
+        self::assertEmpty($this->auditRecords, 'Neither 404 may produce an audit record');
+    }
+
+    #[Test]
+    public function unknown_path_returns_404_before_every_other_check_and_is_not_audited(): void
+    {
+        // Production over plain HTTP from an IP outside the allowlist: a path in
+        // a group would get 403, an unknown path still gets 404.
+        $kernel  = $this->buildKernel(production: true, cidrs: ['10.0.0.0/8']);
+        $request = Request::create('http://example.com/canary/nope', server: ['REMOTE_ADDR' => '203.0.113.9']);
+        $request->headers->set('Authorization', 'Bearer ' . self::MONITORING_TOKEN);
+
+        $response = $this->handle($kernel, $request);
+
+        self::assertSame(404, $response->getStatusCode());
+        self::assertFalse($response->headers->has('WWW-Authenticate'));
+        self::assertEmpty($this->auditRecords, 'Unknown-path 404 must not produce an audit record');
+    }
+
+    #[Test]
+    public function path_equal_to_a_group_name_without_trailing_slash_is_unknown(): void
+    {
+        $kernel   = $this->buildKernel();
+        $response = $this->handle($kernel, Request::create('http://example.com/canary/health'));
+
+        self::assertSame(404, $response->getStatusCode());
+        self::assertEmpty($this->auditRecords);
+    }
+
+    // ------------------------------------------------------------------
+    // WWW-Authenticate on 401
+    // ------------------------------------------------------------------
+
+    #[Test]
+    public function missing_token_401_carries_a_bearer_challenge(): void
+    {
+        $response = $this->handle($this->buildKernel(), Request::create('http://example.com/canary/health/live'));
+
+        self::assertSame(401, $response->getStatusCode());
+        self::assertSame('Bearer', $response->headers->get('WWW-Authenticate'));
+    }
+
+    #[Test]
+    public function wrong_token_401_carries_a_bearer_challenge(): void
+    {
+        $request = Request::create('http://example.com/canary/health/live');
+        $request->headers->set('Authorization', 'Bearer wrong');
+
+        $response = $this->handle($this->buildKernel(), $request);
+
+        self::assertSame(401, $response->getStatusCode());
+        self::assertSame('Bearer', $response->headers->get('WWW-Authenticate'));
+    }
+
+    #[Test]
+    public function non_401_rejections_carry_no_challenge(): void
+    {
+        // IP outside the allowlist -> 403, which is not an authentication challenge.
+        $request = Request::create('http://example.com/canary/health/live', server: ['REMOTE_ADDR' => '203.0.113.9']);
+
+        $response = $this->handle($this->buildKernel(cidrs: ['10.0.0.0/8']), $request);
+
+        self::assertSame(403, $response->getStatusCode());
+        self::assertFalse($response->headers->has('WWW-Authenticate'));
+    }
+
+    /**
+     * Body with the per-request values (request ID, duration) blanked out.
+     *
+     * @return array<string, mixed>
+     */
+    private function normalisedBody(Response $response): array
+    {
+        $body = json_decode((string) $response->getContent(), true, flags: JSON_THROW_ON_ERROR);
+        self::assertIsArray($body);
+        self::assertIsArray($body['meta'] ?? null);
+        $body['meta']['request_id']  = '<id>';
+        $body['meta']['duration_ms'] = 0;
+
+        return $body;
+    }
+
+    /**
+     * Header names and values, with the per-request ID and Date blanked out.
+     *
+     * @return array<string, list<string|null>>
+     */
+    private function normalisedHeaders(Response $response): array
+    {
+        $headers = $response->headers->all();
+        self::assertStringStartsWith('canary-', (string) $response->headers->get('X-Canary-RequestId'));
+        $headers['x-canary-requestid'] = ['<id>'];
+        unset($headers['date']);
+        ksort($headers);
+
+        return $headers;
     }
 }
